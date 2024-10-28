@@ -1,77 +1,62 @@
 # clipboard
 
-Copy files and text through network.
-Main lowlevel logic from [FreeRDP](https://github.com/FreeRDP/FreeRDP).
+通过网络复制文件和文本
 
-To enjoy file copy and paste feature on Linux/OSX,
-please build with `unix-file-copy-paste` feature.
+## 工作原理
 
-TODO: Move this lib to a separate project.
+术语:
 
-## How it works
+- cliprdr: 此模块
+- local: 发起文件复制事件的一端
+- remote: 粘贴来自 `local` 复制的文件的一端 
 
-Terminalogies:
-
-- cliprdr: this module
-- local: the endpoint which initiates a file copy events
-- remote: the endpoint which paste the file copied from `local`
-
-The main algorithm of copying and pasting files is from
+文件复制和粘贴的主要算法基于
 [Remote Desktop Protocol: Clipboard Virtual Channel Extension](https://winprotocoldoc.blob.core.windows.net/productionwindowsarchives/MS-RDPECLIP/%5bMS-RDPECLIP%5d.pdf),
-and could be concluded as:
+可以总结如下:
 
-0. local and remote notify each other that it's ready.
-1. local subscribes/listening to the system's clipboard for file copy
-2. local once got file copy event, notice the remote
-3. remote confirms receive and try pulls the file list
-4. local updates its file-list, the remote flushes pulled file list to the clipboard
-5. remote OS or desktop manager initiates a paste, making other programs reading
-   clipboard files. Convert those reading requests to RPCs
+0. local 和 remote 互相通知已准备就绪。
+1. local 订阅/监听系统剪贴板的文件复制事件。
+2. local 收到文件复制事件后，通知 remote。
+3. remote 确认收到并尝试拉取文件列表。
+4. local 更新其文件列表，remote 将接收到的文件列表刷新到剪贴板。
+5. remote 的操作系统或桌面管理器发起粘贴，使其他程序读取剪贴板文件。将这些读取请求转换为 RPC 调用：
+   - 在 Windows 上，所有文件读取都会通过流文件 API 进行。
 
-   - on Windows, all file reading will go through the stream file API
-   - on Linux/OSX, FUSE is used for converting reading requests to RPCs
-     - in case of local clipboard been transferred back
-       and leading to a dead loop,
-       all file copy event pointing at the FUSE directory will be ignored
+6. 一个接一个地完成所有文件的粘贴.
 
-6. finishing pasting all files one by one.
-
-In a perspective of network data transferring:
+从网络数据传输的角度来看:
 
 ```mermaid
 sequenceDiagram
     participant l as Local
     participant r as Remote
-    note over l, r: Initialize
+    note over l, r: 初始化
     l ->> r: Monitor Ready
     r ->> l: Monitor Ready
-    loop Get clipboard update
-        l ->> r: Format List (I got update)
-        r ->> l: Format List Response (notified)
-        r ->> l: Format Data Request (requests file list)
+    loop 获取剪贴板更新
+        l ->> r: Format List (我有更新)
+        r ->> l: Format List Response (通知完成)
+        r ->> l: Format Data Request (请求文件列表)
         activate l
-            note left of l: Retrive file list from system clipboard
-            l ->> r: Format Data Response (containing file list)
+            note left of l: 从系统剪贴板获取文件列表
+            l ->> r: Format Data Response (包含文件列表)
         deactivate l
-        note over r: Update system clipboard with received file list
+        note over r: 使用接收到的文件列表更新系统剪贴板
     end
-    loop Some application requests copied files
-        note right of r: application reads file from x to x+y
-        note over r: the file is the a-th file on list
-        r ->> l: File Contents Request (read file a offset x size y)
+    loop 某应用请求已复制的文件
+        note right of r: 应用读取文件从 x 到 x+y
+        note over r: 该文件是列表中的第 a 个文件
+        r ->> l: File Contents Request (读取文件 a 偏移量 x 大小 y)
         activate l
-            note left of l: Find a-th file on list, read from x to x+y
-            l ->> r: File Contents Response (contents of file a offset x size y)
+            note left of l: 找到列表中的第 a 个文件，读取从 x 到 x+y
+            l ->> r: File Contents Response (文件 a 偏移量 x 大小 y 的内容)
         deactivate l
     end
 ```
 
-Note: In actual implementation, both sides could play send clipboard update
-and request file contents.
-There is no such limitation that only local can update clipboard
-and copy files to remote.
+注意：在实际实现中，双方都可以发送剪贴板更新并请求文件内容。并没有只允许 local 更新剪贴板并将文件复制到 remote 的限制。
 
-## impl
+## 实现
 
 ### windows
 
@@ -81,81 +66,8 @@ and copy files to remote.
 
 ![B1->A1](./docs/assets/win_B_A.png)
 
-The protocol was originally designed as an extension of the Windows RDP,
-so the specific message packages fits windows well.
+该协议最初设计为 Windows RDP 的扩展，因此消息包的格式非常适合 Windows。
 
-When starting cliprdr, a thread is spawn to create a invisible window
-and to subscribe to OLE clipboard events.
-The window's callback (see `cliprdr_proc` in `src/windows/wf_cliprdr.c`) was
-set to handle a variaty of events.
+启动 cliprdr 时，会创建一个线程以创建一个不可见窗口并订阅 OLE 剪贴板事件。窗口的回调（见 src/windows/wf_cliprdr.c 中的 cliprdr_proc）被设置为处理各种事件。
 
-Detailed implementation is shown in pictures above.
-
-### Linux/OSX
-
-The Cliprdr Server implementation has mainly 3 parts:
-
-- Clipboard Client
-- Local File list
-- FUSE server
-
-#### Clipboard Client
-
-The clipboard client has a thread polling for file urls on clipboard.
-
-If the client found any updates of file urls,
-after filtering out those pointing to our FUSE directory or duplicated,
-send format list directly to remote.
-
-The cliprdr server also uses clipboard client for setting clipboard,
-or retrive paths from system.
-
-#### Local File List
-
-The local file list is a temperary list of file metadata.
-When receiving file contents PDU from peer, the server picks
-out the file requested and open it for reading if necessary.
-
-Also when receiving Format Data Request PDU from remote asking for file list,
-the local file list should be rebuilt from file list retrieved from Clipboard Client.
-
-Some caching and preloading could done on it since applications are likely to read
-on the list sequentially.
-
-#### FUSE server
-
-The FUSE server could convert POSIX file reading request to File Contents
-Request/Response RPCs.
-
-When received file list from remote,
-the FUSE server will figure out the file system tree and rearrange its content.
-
-#### Groceries
-
-- The protocol was originally implemented for windows,
-  so paths in PDU will all be converted to DOS formats in UTF-16 LE encoding,
-  and datetimes will be converted to LDAP timestamp instead of
-  unix timestamp
-
-  ```text
-  UNIX
-  /usr/bin/rustdesk
-  ->
-  DOS
-  \usr\bin\rustdesk
-  ```
-
-- To better fit for preserving permissions on unix-like platforms,
-  a reserved area of FileDescriptor PDU
-
-- you may notice
-  the mountpoint is still occupied after the application quits.
-  That's because the FUSE server was not mounted with `AUTO_UNMOUNT`.
-  - It's hard to implement gressful shutdown for a multi-processed program
-  - `AUTO_UNMOUNT` was not enabled by default and requires enable
-    `user_allow_other` in configure. Letting users edit such global
-    configuration to use this feature might not be a good idea.
-  - use [`umount()`](https://man7.org/linux/man-pages/man2/umount.2.html)
-    syscall to unmount will also require that option.
-  - we currently directly call [`umount`](https://man7.org/linux/man-pages/man8/umount.8.html)
-    program to unmount dangling FUSE server. It worked perfectly for now.
+详细实现见上图.
